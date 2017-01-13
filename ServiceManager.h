@@ -4,7 +4,6 @@
 #include <android/hidl/manager/1.0/IServiceManager.h>
 #include <hidl/Status.h>
 #include <hidl/MQDescriptor.h>
-#include <map>
 #include <unordered_map>
 
 #include "HidlService.h"
@@ -15,24 +14,24 @@ namespace manager {
 namespace V1_0 {
 namespace implementation {
 
+using ::android::hardware::hidl_death_recipient;
 using ::android::hardware::hidl_vec;
 using ::android::hardware::hidl_string;
-using ::android::hardware::hidl_version;
-using ::android::hardware::IBinder;
 using ::android::hardware::Return;
 using ::android::hardware::Void;
+using ::android::hidl::base::V1_0::IBase;
 using ::android::hidl::manager::V1_0::IServiceManager;
 using ::android::hidl::manager::V1_0::IServiceNotification;
 using ::android::sp;
+using ::android::wp;
 
-struct ServiceManager : public IServiceManager {
+struct ServiceManager : public IServiceManager, hidl_death_recipient {
     // Methods from ::android::hidl::manager::V1_0::IServiceManager follow.
-    Return<void> get(const hidl_string& fqName,
-                     const hidl_string& name,
-                     get_cb _hidl_cb)  override;
+    Return<sp<IBase>> get(const hidl_string& fqName,
+                     const hidl_string& name) override;
     Return<bool> add(const hidl_vec<hidl_string>& interfaceChain,
                      const hidl_string& name,
-                     const sp<IBinder>& service) override;
+                     const sp<IBase>& service) override;
 
     Return<void> list(list_cb _hidl_cb) override;
     Return<void> listByInterface(const hidl_string& fqInstanceName,
@@ -42,9 +41,11 @@ struct ServiceManager : public IServiceManager {
                                           const hidl_string& name,
                                           const sp<IServiceNotification>& callback) override;
 
+    virtual void serviceDied(uint64_t cookie, const wp<IBase>& who);
 private:
+    bool remove(const wp<IBase>& who);
 
-    using InstanceMap = std::multimap<
+    using InstanceMap = std::unordered_map<
             std::string, // instance name e.x. "manager"
             std::unique_ptr<HidlService>
         >;
@@ -54,36 +55,25 @@ private:
         const InstanceMap &getInstanceMap() const;
 
         /**
-         * Finds a HidlService which supports the desired version. If none,
+         * Finds a HidlService with the desired name. If none,
          * returns nullptr. HidlService::getService() might also be nullptr
          * if there are registered IServiceNotification objects for it. Return
          * value should be treated as a temporary reference.
          */
-        HidlService *lookupSupporting(
-            const std::string &name,
-            const hidl_version &version);
-        const HidlService *lookupSupporting(
-            const std::string &name,
-            const hidl_version &version) const;
-        /**
-         * Finds a HidlService which is exactly the desired version. If none,
-         * returns nullptr. HidlService::getService() might also be nullptr
-         * if there are registered IServiceNotification objects for it. Return
-         * value should be treated as a temporary reference.
-         */
-        HidlService *lookupExact(
-            const std::string &name,
-            const hidl_version &version);
+        HidlService *lookup(
+            const std::string &name);
+        const HidlService *lookup(
+            const std::string &name) const;
 
         void insertService(std::unique_ptr<HidlService> &&service);
 
         void addPackageListener(sp<IServiceNotification> listener);
 
-    private:
         void sendPackageRegistrationNotification(
             const hidl_string &fqName,
             const hidl_string &instanceName) const;
 
+    private:
         InstanceMap mInstanceMap{};
 
         std::vector<sp<IServiceNotification>> mPackageListeners{};
@@ -94,11 +84,11 @@ private:
      * is single-threaded.
      *
      * e.x.
-     * mServiceMap["android.hidl.manager::IServiceManager"]["manager"]
+     * mServiceMap["android.hidl.manager@1.0::IServiceManager"]["manager"]
      *     -> HidlService object
      */
     std::unordered_map<
-        std::string, // package::interface e.x. "android.hidl.manager::IServiceManager"
+        std::string, // package::interface e.x. "android.hidl.manager@1.0::IServiceManager"
         PackageInterfaceMap
     > mServiceMap;
 };
