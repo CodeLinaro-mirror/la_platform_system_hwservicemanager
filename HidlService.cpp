@@ -38,7 +38,9 @@ void HidlService::addListener(const sp<IServiceNotification> &listener) {
     mListeners.push_back(listener);
 
     if (mService != nullptr) {
-        listener->onRegistration(mInterfaceName, mInstanceName, true /* preexisting */);
+        auto ret = listener->onRegistration(
+            mInterfaceName, mInstanceName, true /* preexisting */);
+        ret.isOk(); // ignore
     }
 }
 
@@ -48,7 +50,7 @@ std::string HidlService::string() const {
     return ss.str();
 }
 
-void HidlService::sendRegistrationNotifications() const {
+void HidlService::sendRegistrationNotifications() {
     if (mListeners.size() == 0 || mService == nullptr) {
         return;
     }
@@ -56,10 +58,18 @@ void HidlService::sendRegistrationNotifications() const {
     hidl_string iface = mInterfaceName;
     hidl_string name = mInstanceName;
 
-    for (const auto &listener : mListeners) {
-        auto ret = listener->onRegistration(iface, name, false /* preexisting */);
-        ret.isOk(); // ignore result
+    for (auto it = mListeners.begin(); it != mListeners.end();) {
+        auto ret = (*it)->onRegistration(iface, name, false /* preexisting */);
+        if (ret.isOk()) {
+            ++it;
+        } else {
+            it = mListeners.erase(it);
+        }
     }
+}
+
+size_t HidlService::getServiceStrongCount() const {
+    return mService->getStrongCount();
 }
 
 }  // namespace implementation

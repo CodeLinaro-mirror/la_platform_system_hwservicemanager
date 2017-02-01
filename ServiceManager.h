@@ -4,7 +4,7 @@
 #include <android/hidl/manager/1.0/IServiceManager.h>
 #include <hidl/Status.h>
 #include <hidl/MQDescriptor.h>
-#include <unordered_map>
+#include <map>
 
 #include "HidlService.h"
 
@@ -41,11 +41,15 @@ struct ServiceManager : public IServiceManager, hidl_death_recipient {
                                           const hidl_string& name,
                                           const sp<IServiceNotification>& callback) override;
 
+    Return<void> debugDump(debugDump_cb _cb) override;
+
     virtual void serviceDied(uint64_t cookie, const wp<IBase>& who);
 private:
     bool remove(const wp<IBase>& who);
+    size_t countExistingService() const;
+    void forEachExistingService(std::function<void(const HidlService *)> f) const;
 
-    using InstanceMap = std::unordered_map<
+    using InstanceMap = std::map<
             std::string, // instance name e.x. "manager"
             std::unique_ptr<HidlService>
         >;
@@ -87,7 +91,7 @@ private:
      * mServiceMap["android.hidl.manager@1.0::IServiceManager"]["manager"]
      *     -> HidlService object
      */
-    std::unordered_map<
+    std::map<
         std::string, // package::interface e.x. "android.hidl.manager@1.0::IServiceManager"
         PackageInterfaceMap
     > mServiceMap;
