@@ -43,7 +43,7 @@ using android::hidl::token::V1_0::ITokenManager;
 using android::hidl::manager::V1_0::implementation::ServiceManager;
 using android::hidl::token::V1_0::implementation::TokenManager;
 
-static std::string serviceName = "manager";
+static std::string serviceName = "default";
 
 class BinderCallback : public LooperCallback {
 public:
@@ -61,20 +61,15 @@ int main() {
 
     ServiceManager *manager = new ServiceManager();
 
-    manager->interfaceChain([&](const auto &chain) {
-        if (!manager->add(chain, serviceName, manager)) {
-            ALOGE("Failed to register hwservicemanager with itself.");
-        }
-    });
+    if (!manager->add(serviceName, manager)) {
+        ALOGE("Failed to register hwservicemanager with itself.");
+    }
 
     TokenManager *tokenManager = new TokenManager();
 
-    hidl_vec<hidl_string> tokenChain;
-    tokenManager->interfaceChain([&](const auto &chain) {
-        if (!manager->add(chain, serviceName, tokenManager)) {
-            ALOGE("Failed to register ITokenManager with hwservicemanager.");
-        }
-    });
+    if (!manager->add(serviceName, tokenManager)) {
+        ALOGE("Failed to register ITokenManager with hwservicemanager.");
+    }
 
     sp<Looper> looper(Looper::prepare(0 /* opts */));
 
