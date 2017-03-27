@@ -13,19 +13,26 @@ namespace implementation {
 HidlService::HidlService(
     const std::string &interfaceName,
     const std::string &instanceName,
-    const sp<IBase> &service)
+    const sp<IBase> &service,
+    pid_t pid)
 : mInterfaceName(interfaceName),
   mInstanceName(instanceName),
-  mService(service)
+  mService(service),
+  mPid(pid)
 {}
 
 sp<IBase> HidlService::getService() const {
     return mService;
 }
-void HidlService::setService(sp<IBase> service) {
+void HidlService::setService(sp<IBase> service, pid_t pid) {
     mService = service;
+    mPid = pid;
 
     sendRegistrationNotifications();
+}
+
+pid_t HidlService::getPid() const {
+    return mPid;
 }
 const std::string &HidlService::getInterfaceName() const {
     return mInterfaceName;
@@ -35,13 +42,32 @@ const std::string &HidlService::getInstanceName() const {
 }
 
 void HidlService::addListener(const sp<IServiceNotification> &listener) {
-    mListeners.push_back(listener);
-
     if (mService != nullptr) {
         auto ret = listener->onRegistration(
             mInterfaceName, mInstanceName, true /* preexisting */);
-        ret.isOk(); // ignore
+        if (!ret.isOk()) {
+            LOG(ERROR) << "Not adding listener for " << mInterfaceName << "/"
+                       << mInstanceName << ": transport error when sending "
+                       << "notification for already registered instance.";
+            return;
+        }
     }
+    mListeners.push_back(listener);
+}
+
+bool HidlService::removeListener(const wp<IBase>& listener) {
+    bool found = false;
+
+    for (auto it = mListeners.begin(); it != mListeners.end();) {
+        if (*it == listener) {
+            it = mListeners.erase(it);
+            found = true;
+        } else {
+            ++it;
+        }
+    }
+
+    return found;
 }
 
 void HidlService::registerPassthroughClient(pid_t pid) {
@@ -71,6 +97,8 @@ void HidlService::sendRegistrationNotifications() {
         if (ret.isOk()) {
             ++it;
         } else {
+            LOG(ERROR) << "Dropping registration callback for " << iface << "/" << name
+                       << ": transport error.";
             it = mListeners.erase(it);
         }
     }
