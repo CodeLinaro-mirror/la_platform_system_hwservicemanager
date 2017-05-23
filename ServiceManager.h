@@ -6,6 +6,7 @@
 #include <hidl/MQDescriptor.h>
 #include <map>
 
+#include "AccessControl.h"
 #include "HidlService.h"
 
 namespace android {
@@ -45,7 +46,7 @@ struct ServiceManager : public IServiceManager, hidl_death_recipient {
 
     Return<void> debugDump(debugDump_cb _cb) override;
     Return<void> registerPassthroughClient(const hidl_string &fqName,
-            const hidl_string &name, int32_t pid) override;
+            const hidl_string &name) override;
 
     virtual void serviceDied(uint64_t cookie, const wp<IBase>& who);
 private:
@@ -90,6 +91,8 @@ private:
 
         std::vector<sp<IServiceNotification>> mPackageListeners{};
     };
+
+    AccessControl mAcl;
 
     /**
      * Access to this map doesn't need to be locked, since hwservicemanager
