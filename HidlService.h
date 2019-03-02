@@ -42,7 +42,7 @@ struct HidlService {
      */
     sp<IBase> getService() const;
     void setService(sp<IBase> service, pid_t pid);
-    pid_t getPid() const;
+    pid_t getDebugPid() const;
     const std::string &getInterfaceName() const;
     const std::string &getInstanceName() const;
 
@@ -52,13 +52,20 @@ struct HidlService {
 
     void addClientCallback(const sp<IClientCallback>& callback);
     bool removeClientCallback(const sp<IClientCallback>& callback);
-    void handleClientCallbacks();
+
+    // return is number of clients (-1 means this is not implemented)
+    // count includes one held by hwservicemanager
+    ssize_t handleClientCallbacks(bool isCalledOnInterval);
+
+    // when giving out a handle to a client, but the kernel might not know this yet
+    void guaranteeClient();
 
     std::string string() const; // e.x. "android.hidl.manager@1.0::IServiceManager/manager"
     const std::set<pid_t> &getPassthroughClients() const;
 
 private:
     void sendRegistrationNotifications();
+    void sendClientCallbackNotifications(bool hasClients);
 
     const std::string                     mInterfaceName; // e.x. "android.hidl.manager@1.0::IServiceManager"
     const std::string                     mInstanceName;  // e.x. "manager"
@@ -70,6 +77,8 @@ private:
 
     std::vector<sp<IClientCallback>>      mClientCallbacks{};
     bool                                  mHasClients = false; // notifications sent on true -> false.
+    bool                                  mGuaranteeClient = false; // whenever a client is handed out
+    size_t                                mNoClientsCounter = 0;
 };
 
 }  // namespace implementation

@@ -20,6 +20,23 @@ namespace hidl {
 namespace manager {
 namespace implementation {
 
+AccessControl::CallingContext getBinderCallingContext() {
+    const auto& self = IPCThreadState::self();
+
+    pid_t pid = self->getCallingPid();
+    const char* sid = self->getCallingSid();
+
+    if (sid == nullptr) {
+        if (pid != getpid()) {
+            android_errorWriteLog(0x534e4554, "121035042");
+        }
+
+        return AccessControl::getCallingContext(pid);
+    } else {
+        return { true, sid, pid };
+    }
+}
+
 static constexpr uint64_t kServiceDiedCookie = 0;
 static constexpr uint64_t kPackageListenerDiedCookie = 1;
 static constexpr uint64_t kServiceListenerDiedCookie = 2;
@@ -74,6 +91,19 @@ void ServiceManager::forEachServiceEntry(std::function<bool(HidlService *)> f) {
             }
         }
     }
+}
+
+HidlService* ServiceManager::lookup(const std::string& fqName, const std::string& name) {
+    auto ifaceIt = mServiceMap.find(fqName);
+    if (ifaceIt == mServiceMap.end()) {
+        return nullptr;
+    }
+
+    PackageInterfaceMap &ifaceMap = ifaceIt->second;
+
+    HidlService *hidlService = ifaceMap.lookup(name);
+
+    return hidlService;
 }
 
 void ServiceManager::serviceDied(uint64_t cookie, const wp<IBase>& who) {
@@ -215,32 +245,25 @@ Return<sp<IBase>> ServiceManager::get(const hidl_string& hidlFqName,
     const std::string fqName = hidlFqName;
     const std::string name = hidlName;
 
-    pid_t pid = IPCThreadState::self()->getCallingPid();
-    if (!mAcl.canGet(fqName, pid)) {
+    if (!mAcl.canGet(fqName, getBinderCallingContext())) {
         return nullptr;
     }
 
-    auto ifaceIt = mServiceMap.find(fqName);
-    if (ifaceIt == mServiceMap.end()) {
-        tryStartService(fqName, hidlName);
-        return nullptr;
-    }
-
-    PackageInterfaceMap &ifaceMap = ifaceIt->second;
-
-    // may be modified in post-command task
-    HidlService *hidlService = ifaceMap.lookup(name);
-
+    HidlService* hidlService = lookup(fqName, name);
     if (hidlService == nullptr) {
-        tryStartService(fqName, hidlName);
+        tryStartService(fqName, name);
         return nullptr;
     }
 
     sp<IBase> service = hidlService->getService();
     if (service == nullptr) {
-        tryStartService(fqName, hidlName);
+        tryStartService(fqName, name);
         return nullptr;
     }
+
+    // Let HidlService know that we handed out a client. If the client drops the service before the
+    // next time handleClientCallbacks is called, it will still know that the service had been handed out.
+    hidlService->guaranteeClient();
 
     // This is executed immediately after the binder driver confirms the transaction. The driver
     // will update the appropriate data structures to reflect the fact that the client now has the
@@ -248,7 +271,7 @@ Return<sp<IBase>> ServiceManager::get(const hidl_string& hidlFqName,
     // time. This will run before anything else can modify the HidlService which is owned by this
     // object, so it will be in the same state that it was when this function returns.
     hardware::addPostCommandTask([hidlService] {
-        hidlService->handleClientCallbacks();
+        hidlService->handleClientCallbacks(false /* isCalledOnInterval */);
     });
 
     return service;
@@ -261,11 +284,10 @@ Return<bool> ServiceManager::add(const hidl_string& name, const sp<IBase>& servi
         return false;
     }
 
-    pid_t pid = IPCThreadState::self()->getCallingPid();
-    auto context = mAcl.getContext(pid);
+    auto pidcon = getBinderCallingContext();
 
     auto ret = service->interfaceChain([&](const auto &interfaceChain) {
-        addSuccess = addImpl(name, service, interfaceChain, context, pid);
+        addSuccess = addImpl(name, service, interfaceChain, pidcon);
     });
 
     if (!ret.isOk()) {
@@ -279,8 +301,7 @@ Return<bool> ServiceManager::add(const hidl_string& name, const sp<IBase>& servi
 bool ServiceManager::addImpl(const hidl_string& name,
                              const sp<IBase>& service,
                              const hidl_vec<hidl_string>& interfaceChain,
-                             const AccessControl::Context &context,
-                             pid_t pid) {
+                             const AccessControl::CallingContext& callingContext) {
     if (interfaceChain.size() == 0) {
         LOG(WARNING) << "Empty interface chain for " << name;
         return false;
@@ -290,7 +311,7 @@ bool ServiceManager::addImpl(const hidl_string& name,
     for(size_t i = 0; i < interfaceChain.size(); i++) {
         const std::string fqName = interfaceChain[i];
 
-        if (!mAcl.canAdd(fqName, context, pid)) {
+        if (!mAcl.canAdd(fqName, callingContext)) {
             return false;
         }
     }
@@ -323,9 +344,9 @@ bool ServiceManager::addImpl(const hidl_string& name,
 
         if (hidlService == nullptr) {
             ifaceMap.insertService(
-                std::make_unique<HidlService>(fqName, name, service, pid));
+                std::make_unique<HidlService>(fqName, name, service, callingContext.pid));
         } else {
-            hidlService->setService(service, pid);
+            hidlService->setService(service, callingContext.pid);
         }
 
         ifaceMap.sendPackageRegistrationNotification(fqName, name);
@@ -343,8 +364,7 @@ Return<ServiceManager::Transport> ServiceManager::getTransport(const hidl_string
                                                                const hidl_string& name) {
     using ::android::hardware::getTransport;
 
-    pid_t pid = IPCThreadState::self()->getCallingPid();
-    if (!mAcl.canGet(fqName, pid)) {
+    if (!mAcl.canGet(fqName, getBinderCallingContext())) {
         return Transport::EMPTY;
     }
 
@@ -360,8 +380,7 @@ Return<ServiceManager::Transport> ServiceManager::getTransport(const hidl_string
 }
 
 Return<void> ServiceManager::list(list_cb _hidl_cb) {
-    pid_t pid = IPCThreadState::self()->getCallingPid();
-    if (!mAcl.canList(pid)) {
+    if (!mAcl.canList(getBinderCallingContext())) {
         _hidl_cb({});
         return Void();
     }
@@ -382,8 +401,7 @@ Return<void> ServiceManager::list(list_cb _hidl_cb) {
 
 Return<void> ServiceManager::listByInterface(const hidl_string& fqName,
                                              listByInterface_cb _hidl_cb) {
-    pid_t pid = IPCThreadState::self()->getCallingPid();
-    if (!mAcl.canGet(fqName, pid)) {
+    if (!mAcl.canGet(fqName, getBinderCallingContext())) {
         _hidl_cb({});
         return Void();
     }
@@ -426,8 +444,7 @@ Return<bool> ServiceManager::registerForNotifications(const hidl_string& fqName,
         return false;
     }
 
-    pid_t pid = IPCThreadState::self()->getCallingPid();
-    if (!mAcl.canGet(fqName, pid)) {
+    if (!mAcl.canGet(fqName, getBinderCallingContext())) {
         return false;
     }
 
@@ -498,42 +515,52 @@ Return<bool> ServiceManager::unregisterForNotifications(const hidl_string& fqNam
     return service->removeListener(callback);
 }
 
-Return<bool> ServiceManager::registerClientCallback(const sp<IBase>& server,
+Return<bool> ServiceManager::registerClientCallback(const hidl_string& hidlFqName,
+                                                    const hidl_string& hidlName,
+                                                    const sp<IBase>& server,
                                                     const sp<IClientCallback>& cb) {
     if (server == nullptr || cb == nullptr) return false;
 
+    const std::string fqName = hidlFqName;
+    const std::string name = hidlName;
+
     // only the server of the interface can register a client callback
     pid_t pid = IPCThreadState::self()->getCallingPid();
-
-    HidlService* registered = nullptr;
-
-    forEachExistingService([&] (HidlService *service) {
-        if (service->getPid() != pid) {
-            return true;  // continue
-        }
-
-        if (interfacesEqual(service->getService(), server)) {
-            service->addClientCallback(cb);
-            registered = service;
-            return false;  // break
-        }
-        return true;  // continue
-    });
-
-    if (registered != nullptr) {
-        bool linkRet = cb->linkToDeath(this, kClientCallbackDiedCookie).withDefault(false);
-        if (!linkRet) {
-            LOG(ERROR) << "Could not link to death for registerClientCallback";
-            unregisterClientCallback(server, cb);
-            registered = nullptr;
-        }
+    if (!mAcl.canAdd(fqName, getBinderCallingContext())) {
+        return false;
     }
 
-    if (registered != nullptr) {
-        registered->handleClientCallbacks();
+    HidlService* registered = lookup(fqName, name);
+
+    if (registered == nullptr) {
+        return false;
     }
 
-    return registered != nullptr;
+    // sanity
+    if (registered->getDebugPid() != pid) {
+        LOG(WARNING) << "Only a server can register for client callbacks (for " << fqName
+            << "/" << name << ")";
+        return false;
+    }
+
+    sp<IBase> service = registered->getService();
+
+    if (!interfacesEqual(service, server)) {
+        LOG(WARNING) << "Tried to register client callback for " << fqName << "/" << name
+            << " but a different service is registered under this name.";
+        return false;
+    }
+
+    bool linkRet = cb->linkToDeath(this, kClientCallbackDiedCookie).withDefault(false);
+    if (!linkRet) {
+        LOG(ERROR) << "Could not link to death for registerClientCallback";
+        return false;
+    }
+
+    registered->addClientCallback(cb);
+    registered->handleClientCallbacks(false /* isCalledOnInterval */);
+
+    return true;
 }
 
 Return<bool> ServiceManager::unregisterClientCallback(const sp<IBase>& server,
@@ -554,7 +581,7 @@ Return<bool> ServiceManager::unregisterClientCallback(const sp<IBase>& server,
 
 void ServiceManager::handleClientCallbacks() {
     forEachServiceEntry([&] (HidlService *service) {
-        service->handleClientCallbacks();
+        service->handleClientCallbacks(true /* isCalledOnInterval */);
         return true;  // continue
     });
 }
@@ -566,16 +593,14 @@ Return<bool> ServiceManager::addWithChain(const hidl_string& name,
         return false;
     }
 
-    pid_t pid = IPCThreadState::self()->getCallingPid();
-    auto context = mAcl.getContext(pid);
+    auto callingContext = getBinderCallingContext();
 
-    return addImpl(name, service, chain, context, pid);
+    return addImpl(name, service, chain, callingContext);
 }
 
 Return<void> ServiceManager::listManifestByInterface(const hidl_string& fqName,
                                                      listManifestByInterface_cb _hidl_cb) {
-    pid_t pid = IPCThreadState::self()->getCallingPid();
-    if (!mAcl.canGet(fqName, pid)) {
+    if (!mAcl.canGet(fqName, getBinderCallingContext())) {
         _hidl_cb({});
         return Void();
     }
@@ -587,9 +612,65 @@ Return<void> ServiceManager::listManifestByInterface(const hidl_string& fqName,
     return Void();
 }
 
-Return<void> ServiceManager::debugDump(debugDump_cb _cb) {
+Return<bool> ServiceManager::tryUnregister(const hidl_string& hidlFqName,
+                                           const hidl_string& hidlName,
+                                           const sp<IBase>& service) {
+    const std::string fqName = hidlFqName;
+    const std::string name = hidlName;
+
+    if (service == nullptr) {
+        return false;
+    }
+
+    if (!mAcl.canAdd(fqName, getBinderCallingContext())) {
+        return false;
+    }
+
+    HidlService* registered = lookup(fqName, name);
+
+    // sanity
     pid_t pid = IPCThreadState::self()->getCallingPid();
-    if (!mAcl.canList(pid)) {
+    if (registered->getDebugPid() != pid) {
+        LOG(WARNING) << "Only a server can unregister itself (for " << fqName
+            << "/" << name << ")";
+        return false;
+    }
+
+    sp<IBase> server = registered->getService();
+
+    if (!interfacesEqual(service, server)) {
+        LOG(WARNING) << "Tried to unregister for " << fqName << "/" << name
+            << " but a different service is registered under this name.";
+        return false;
+    }
+
+    int clients = registered->handleClientCallbacks(false /* isCalledOnInterval */);
+
+    // clients < 0: feature not implemented or other error. Assume clients.
+    // Otherwise:
+    // - kernel driver will hold onto one refcount (during this transaction)
+    // - hwservicemanager has a refcount (guaranteed by this transaction)
+    // So, if clients > 2, then at least one other service on the system must hold a refcount.
+    if (clients < 0 || clients > 2) {
+        // client callbacks are either disabled or there are other clients
+        LOG(INFO) << "Tried to unregister for " << fqName << "/" << name
+            << " but there are clients: " << clients;
+        return false;
+    }
+
+    // will remove entire parent hierarchy
+    bool success = removeService(service, &name /*restrictToInstanceName*/);
+
+    if (registered->getService() != nullptr) {
+        LOG(ERROR) << "Bad state. Unregistration failed for " << fqName << "/" << name << ".";
+        return false;
+    }
+
+    return success;
+}
+
+Return<void> ServiceManager::debugDump(debugDump_cb _cb) {
+    if (!mAcl.canList(getBinderCallingContext())) {
         _cb({});
         return Void();
     }
@@ -605,7 +686,7 @@ Return<void> ServiceManager::debugDump(debugDump_cb _cb) {
         }
 
         list.push_back({
-            .pid = service->getPid(),
+            .pid = service->getDebugPid(),
             .interfaceName = service->getInterfaceName(),
             .instanceName = service->getInstanceName(),
             .clientPids = clientPids,
@@ -622,8 +703,9 @@ Return<void> ServiceManager::debugDump(debugDump_cb _cb) {
 
 Return<void> ServiceManager::registerPassthroughClient(const hidl_string &fqName,
         const hidl_string &name) {
-    pid_t pid = IPCThreadState::self()->getCallingPid();
-    if (!mAcl.canGet(fqName, pid)) {
+    auto callingContext = getBinderCallingContext();
+
+    if (!mAcl.canGet(fqName, callingContext)) {
         /* We guard this function with "get", because it's typically used in
          * the getService() path, albeit for a passthrough service in this
          * case
@@ -643,10 +725,10 @@ Return<void> ServiceManager::registerPassthroughClient(const hidl_string &fqName
 
     if (service == nullptr) {
         auto adding = std::make_unique<HidlService>(fqName, name);
-        adding->registerPassthroughClient(pid);
+        adding->registerPassthroughClient(callingContext.pid);
         ifaceMap.insertService(std::move(adding));
     } else {
-        service->registerPassthroughClient(pid);
+        service->registerPassthroughClient(callingContext.pid);
     }
     return Void();
 }

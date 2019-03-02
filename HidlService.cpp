@@ -13,6 +13,8 @@ namespace hidl {
 namespace manager {
 namespace implementation {
 
+static constexpr int kNoClientRepeatLimit = 2;
+
 HidlService::HidlService(
     const std::string &interfaceName,
     const std::string &instanceName,
@@ -32,11 +34,14 @@ void HidlService::setService(sp<IBase> service, pid_t pid) {
     mPid = pid;
 
     mClientCallbacks.clear();
+    mHasClients = false;
+    mGuaranteeClient = false;
+    mNoClientsCounter = false;
 
     sendRegistrationNotifications();
 }
 
-pid_t HidlService::getPid() const {
+pid_t HidlService::getDebugPid() const {
     return mPid;
 }
 const std::string &HidlService::getInterfaceName() const {
@@ -102,40 +107,47 @@ bool HidlService::removeClientCallback(const sp<IClientCallback>& callback) {
     return found;
 }
 
-void HidlService::handleClientCallbacks() {
+ssize_t HidlService::handleClientCallbacks(bool isCalledOnInterval) {
     using ::android::hardware::toBinder;
     using ::android::hardware::BpHwBinder;
     using ::android::hardware::IBinder;
 
-    if (mClientCallbacks.empty()) return;
-    if (mService == nullptr) return;
+    if (mService == nullptr) return -1;
 
     // this justifies the bp cast below, no in-process HALs need this
-    if (!mService->isRemote()) return;
+    if (!mService->isRemote()) return -1;
 
     sp<IBinder> binder = toBinder(mService);
-    if (binder == nullptr) return;
+    if (binder == nullptr) return -1;
 
     sp<BpHwBinder> bpBinder = static_cast<BpHwBinder*>(binder.get());
     ssize_t count = bpBinder->getNodeStrongRefCount();
 
     // binder driver doesn't support this feature
-    if (count == -1) return;
+    if (count == -1) return count;
 
     bool hasClients = count > 1; // this process holds a strong count
 
-    if (hasClients != mHasClients) {
-        LOG(INFO) << "Notifying " << string() << " they have clients: " << hasClients;
-
-        for (const auto& cb : mClientCallbacks) {
-            Return<void> ret = cb->onClients(getService(), hasClients);
-            if (!ret.isOk()) {
-                LOG(WARNING) << "onClients callback failed for " << string() << ": " << ret.description();
-            }
-        }
+    // a client has its first client OR a handle was handed out, but it was immediately dropped
+    if ((hasClients && !mHasClients) || (mGuaranteeClient && !hasClients)) {
+        sendClientCallbackNotifications(true); // for first ref, or for when we handed it out
     }
 
-    mHasClients = hasClients;
+    // there are no more clients, but the callback has not been called yet
+    if (isCalledOnInterval && !hasClients && mHasClients) {
+        mNoClientsCounter++;
+    }
+
+    if (mNoClientsCounter >= kNoClientRepeatLimit) {
+        sendClientCallbackNotifications(false);
+    }
+
+    mGuaranteeClient = false;
+    return count;
+}
+
+void HidlService::guaranteeClient() {
+    mGuaranteeClient = true;
 }
 
 std::string HidlService::string() const {
@@ -163,6 +175,21 @@ void HidlService::sendRegistrationNotifications() {
         }
     }
 }
+
+void HidlService::sendClientCallbackNotifications(bool hasClients) {
+    LOG(INFO) << "Notifying " << string() << " they have clients: " << hasClients;
+
+    for (const auto& cb : mClientCallbacks) {
+        Return<void> ret = cb->onClients(getService(), hasClients);
+        if (!ret.isOk()) {
+            LOG(WARNING) << "onClients callback failed for " << string() << ": " << ret.description();
+        }
+    }
+
+    mNoClientsCounter = 0;
+    mHasClients = hasClients;
+}
+
 
 }  // namespace implementation
 }  // namespace manager
